@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- **`spot_multiplier` and `export_spot_multiplier` silently reverted to 1.0 on every restart** — These fields were stored correctly by the setup wizard but missing from the startup settings map (`PRICE_STORE_TO_API`), so the optimizer ignored them after every restart. For Belgian ENTSO-e users with a Luminus Dynamic contract (multiplier 1.0175) this caused the optimizer to underestimate import costs by ~1.75% for the entire uptime after each restart. A schema migration ensures existing configurations are also fixed without re-running the wizard. (#126)
 - **Anti-cycling discharge gate no longer over-values stored energy during solar surplus** — When solar already covers all home load for a period, `_compute_reward`'s discharge profitability check no longer credits the discharge with `avoid_purchase_value` (there is no grid purchase to displace when solar covers the load). This closed a leak that let marginal, unprofitable ~0.1 kWh `BATTERY_EXPORT` discharges slip past the `-inf` anti-cycling floor in solar-surplus periods with a full battery. (#204)
 
 ## [9.8.1] - 2026-06-28
