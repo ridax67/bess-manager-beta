@@ -4,6 +4,14 @@ All notable changes to BESS Battery Manager will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.9.0b8] - 2026-07-05
+
+Syncs beta with production main through the self-resolved health-check recovery notice.
+
+### Added
+
+- **Self-resolved health-check issues are now surfaced even if nobody was watching the live banner** — A component that goes ERROR/WARNING then recovers to OK between health checks is now recorded and shown as a "Recovered From an Earlier Issue" banner, including which sensor recovered and when. Acknowledging it clears the notice. ([#239](https://github.com/johanzander/bess-manager/pull/239))
+
 ## [9.9.0b7] - 2026-07-05
 
 ### Fixed
