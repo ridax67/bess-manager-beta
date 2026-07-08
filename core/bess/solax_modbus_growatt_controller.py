@@ -326,51 +326,59 @@ class SolaxModbusGrowattController(GrowattMinController):
             vpp_control,
         )
 
-        # VPP Status written once; Remote Control written every period
+        # VPP Status written once; Remote Control set based on vpp_control
         try:
-            self._enable_vpp(controller)
+            if vpp_control == 1:
+                self._enable_vpp(controller)
+            else:
+                # Load first — disable Remote Control so inverter manages naturally
+                if not self._vpp_status_enabled:
+                    # Still need Status enabled for VPP to work when needed
+                    logger.info("HARDWARE: VPP Status -> Enabled (one-time)")
+                    controller._service_call_with_retry(
+                        "select",
+                        "select_option",
+                        operation="VPP enable status",
+                        entity_id=VPP_STATUS_ENTITY,
+                        option=VPP_ENABLE,
+                    )
+                    if not controller.test_mode:
+                        self._vpp_status_enabled = True
+                    time.sleep(1)
+                if self._vpp_enabled:
+                    logger.info("HARDWARE: VPP Remote Control -> Disabled (load first)")
+                    controller._service_call_with_retry(
+                        "select",
+                        "select_option",
+                        operation="VPP disable remote control (load first)",
+                        entity_id=VPP_REMOTE_CONTROL_ENTITY,
+                        option=VPP_DISABLE,
+                    )
+                    if not controller.test_mode:
+                        self._vpp_enabled = False
         except Exception as e:
-            logger.error("FAILED: Enable VPP: %s", e)
+            logger.error("FAILED: Set VPP control: %s", e)
             errors.append(str(e))
 
-        # Always reset fallback timer every period
-        try:
-            logger.info(
-                "HARDWARE: VPP Time -> %d min (fallback timer reset)",
-                VPP_FALLBACK_MINUTES,
-            )
-            controller._service_call_with_retry(
-                "number",
-                "set_value",
-                operation="VPP reset fallback timer",
-                entity_id=VPP_TIME_ENTITY,
-                value=VPP_FALLBACK_MINUTES,
-            )
-        except Exception as e:
-            logger.error("FAILED: Reset VPP timer: %s", e)
-            errors.append(str(e))
-
-        # Enable/disable AC charging based on grid_charge — only write on change
-        if grid_charge != self._ac_charging_enabled:
+        # Reset fallback timer only when VPP control is active
+        if vpp_control == 1:
             try:
-                option = VPP_ENABLE if grid_charge else VPP_DISABLE
                 logger.info(
-                    "HARDWARE: VPP Allow AC charging -> %s (intent=%s)",
-                    option,
-                    intent,
+                    "HARDWARE: VPP Time -> %d min (fallback timer reset)",
+                    VPP_FALLBACK_MINUTES,
                 )
                 controller._service_call_with_retry(
-                    "select",
-                    "select_option",
-                    operation=f"VPP set AC charging -> {option}",
-                    entity_id=VPP_ALLOW_AC_CHARGING_ENTITY,
-                    option=option,
+                    "number",
+                    "set_value",
+                    operation="VPP reset fallback timer",
+                    entity_id=VPP_TIME_ENTITY,
+                    value=VPP_FALLBACK_MINUTES,
                 )
-                if not controller.test_mode:
-                    self._ac_charging_enabled = grid_charge
             except Exception as e:
-                logger.error("FAILED: Set VPP Allow AC charging: %s", e)
+                logger.error("FAILED: Reset VPP timer: %s", e)
                 errors.append(str(e))
+
+        # AC charging is permanently enabled — no dynamic control needed
 
         # Write VPP power — only on change
         if vpp_power != self._last_written_vpp_power:
@@ -507,8 +515,19 @@ class SolaxModbusGrowattController(GrowattMinController):
         self._update_tou_display_state()
 
     def initialize_hardware(self, controller) -> None:
-        """Sync SOC limits — VPP enabled on first write_schedule_to_hardware."""
+        """Sync SOC limits and enable AC charging permanently."""
         self.sync_soc_limits(controller)
+        try:
+            logger.info("HARDWARE: VPP Allow AC charging -> Enabled (permanent)")
+            controller._service_call_with_retry(
+                "select",
+                "select_option",
+                operation="VPP enable AC charging (permanent)",
+                entity_id=VPP_ALLOW_AC_CHARGING_ENTITY,
+                option=VPP_ENABLE,
+            )
+        except Exception as e:
+            logger.error("FAILED: Set VPP Allow AC charging: %s", e)
 
     # ── Schedule comparison ──────────────────────────────────────────────────
 
