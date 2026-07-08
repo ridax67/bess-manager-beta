@@ -254,7 +254,8 @@ class SolaxModbusGrowattController(GrowattMinController):
     # ── Intent → VPP power ───────────────────────────────────────────────────
 
     def _intent_to_vpp(
-        self, intent: str, discharge_rate: int, grid_charge: bool
+        self, intent: str, discharge_rate: int, grid_charge: bool,
+        current_soc: float | None = None
     ) -> tuple[int, int]:
         """Convert strategic intent to (vpp_power, vpp_control).
 
@@ -278,8 +279,13 @@ class SolaxModbusGrowattController(GrowattMinController):
             else:
                 return 0, 0
         elif intent == "GRID_CHARGING":
-            return 100, 1
+            # TODO: AC charging power set to 40% — change value here if needed
+            return 40, 1
         elif intent == "SOLAR_EXPORT":
+            # If battery is full, load first is sufficient — solar exports naturally.
+            # Grid first with power=0 drains ~200W from battery unnecessarily.
+            if current_soc is not None and current_soc >= 100:
+                return 0, 0
             return 0, 1
         else:
             # SOLAR_STORAGE, LOAD_SUPPORT, IDLE
@@ -312,7 +318,12 @@ class SolaxModbusGrowattController(GrowattMinController):
         if current_period < len(self.strategic_intents):
             intent = self.strategic_intents[current_period]
 
-        vpp_power, vpp_control = self._intent_to_vpp(intent, discharge_rate, grid_charge)
+        # Read current SOC for SOLAR_EXPORT load first decision
+        current_soc = controller.get_battery_soc()
+
+        vpp_power, vpp_control = self._intent_to_vpp(
+            intent, discharge_rate, grid_charge, current_soc
+        )
 
         logger.info(
             "Period %d (%02d:%02d): intent=%s discharge_rate=%d%% "
