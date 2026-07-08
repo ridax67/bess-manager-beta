@@ -1,33 +1,38 @@
 """Growatt MIN inverter controller using solax_modbus with VPP remote power control.
 
-This controller replaces the previous single-segment TOU approach with Growatt's
-VPP remote power control registers, giving per-period power control without any
+This controller replaces the single-segment TOU approach with Growatt's VPP
+remote power control registers, giving per-period power control without any
 TOU segment management.
 
 VPP control entities (via solax_modbus HA integration):
-    select.growatt_inverter_vpp_remote_control  — enable/disable remote control
-    select.growatt_inverter_vpp_status          — enable/disable VPP status
-    select.growatt_inverter_vpp_allow_ac_charging — enable AC charging from grid
+    select.growatt_inverter_vpp_remote_control  — enable/disable per period
+    select.growatt_inverter_vpp_status          — enable once at startup
+    select.growatt_inverter_vpp_allow_ac_charging — enable/disable AC charging
     number.growatt_inverter_vpp_power           — power % (-100..100)
     number.growatt_inverter_vpp_time            — fallback duration in minutes
 
-Enable sequence:  Remote Control → wait 1s → Status
-Disable sequence: Status → wait 1s → Remote Control
+Enable sequence:
+    VPP Status → wait 1s (once at startup or if disabled)
+    VPP Remote Control → written every period together with power commands
 
 VPP Time is written every period (20 min) to reset the fallback timer.
 If BESS stops writing for any reason, the inverter returns to load_first
-after 20 minutes automatically.
+after 20 minutes automatically. Note: TOU control does NOT resume until
+VPP Remote Control is explicitly Disabled (via deinitialize_hardware).
 
-Intent → VPP power mapping:
-    BATTERY_EXPORT → negative % (discharge to grid)
-    GRID_CHARGING  → positive % (charge from grid, AC charging enabled)
-    SOLAR_STORAGE  → 0 (inverter handles solar naturally)
-    LOAD_SUPPORT   → 0 (inverter handles load support naturally)
-    IDLE           → 0
+Intent → VPP mapping:
+    BATTERY_EXPORT (discharge_rate >= 50%) → vpp_power=-100, vpp_control=1
+    BATTERY_EXPORT (discharge_rate <  50%) → vpp_power=0,    vpp_control=0
+    GRID_CHARGING                          → vpp_power=100,  vpp_control=1
+    SOLAR_STORAGE                          → vpp_power=0,    vpp_control=0
+    SOLAR_EXPORT                           → vpp_power=0,    vpp_control=1
+    LOAD_SUPPORT                           → vpp_power=0,    vpp_control=0
+    IDLE                                   → vpp_power=0,    vpp_control=0
 """
 
 import logging
 import time
+from typing import ClassVar
 
 from . import time_utils
 from .dp_schedule import DPSchedule
@@ -52,6 +57,10 @@ VPP_DISABLE = "Disabled"
 # during normal operation.
 VPP_FALLBACK_MINUTES = 20
 
+# Discharge rate threshold below which we use load_first instead of
+# active VPP export — load_first handles low discharge reactively and better.
+VPP_EXPORT_THRESHOLD_PCT = 50
+
 
 class SolaxModbusGrowattController(GrowattMinController):
     """Growatt MIN controller using VPP remote power control.
@@ -59,34 +68,30 @@ class SolaxModbusGrowattController(GrowattMinController):
     Manages per-period charge/discharge power via VPP registers instead of
     TOU segments. Schedule creation and comparison logic is inherited from
     GrowattMinController via strategic intents.
+
+    VPP state is stored as class variables so it survives instance replacement
+    by battery_system_manager each optimization cycle.
     """
 
     # Class-level VPP state — shared across all instances so that when
     # battery_system_manager replaces the controller with a new instance
     # each optimization cycle, the VPP enable state is preserved and
     # flash registers are not written unnecessarily.
-    _class_vpp_enabled: bool = False
     _class_vpp_status_enabled: bool = False
+    _class_vpp_enabled: bool = False
     _class_ac_charging_enabled: bool = False
     _class_last_written_vpp_power: int | None = None
+
+    # VPP controls charge/discharge power directly — disable the separate
+    # EMS charging rate register to avoid conflicting with VPP commands.
+    supports_charge_rate_control: ClassVar[bool] = False
 
     def __init__(self, battery_settings: BatterySettings) -> None:
         """Initialize the VPP controller."""
         super().__init__(battery_settings)
-        # Keep TOU interval lists for API/display compatibility with parent
         self._active_tou_intervals: list[dict] = []
 
-        # VPP controls charge/discharge power directly — disable the separate
-        # EMS charging rate register to avoid conflicting with VPP commands.
-        self.supports_charge_rate_control = False
-
-    @property
-    def _vpp_enabled(self) -> bool:
-        return SolaxModbusGrowattController._class_vpp_enabled
-
-    @_vpp_enabled.setter
-    def _vpp_enabled(self, value: bool) -> None:
-        SolaxModbusGrowattController._class_vpp_enabled = value
+    # ── Class-level state properties ─────────────────────────────────────────
 
     @property
     def _vpp_status_enabled(self) -> bool:
@@ -95,6 +100,14 @@ class SolaxModbusGrowattController(GrowattMinController):
     @_vpp_status_enabled.setter
     def _vpp_status_enabled(self, value: bool) -> None:
         SolaxModbusGrowattController._class_vpp_status_enabled = value
+
+    @property
+    def _vpp_enabled(self) -> bool:
+        return SolaxModbusGrowattController._class_vpp_enabled
+
+    @_vpp_enabled.setter
+    def _vpp_enabled(self, value: bool) -> None:
+        SolaxModbusGrowattController._class_vpp_enabled = value
 
     @property
     def _ac_charging_enabled(self) -> bool:
@@ -132,9 +145,6 @@ class SolaxModbusGrowattController(GrowattMinController):
     ) -> None:
         """Store strategic intents — VPP power is applied per-period.
 
-        No TOU segment computation needed. Strategic intents are stored
-        and used directly in apply_period each quarter-hour.
-
         Args:
             schedule: DPSchedule containing strategic_intent list.
             current_period: Current 15-minute period (0-95).
@@ -150,7 +160,6 @@ class SolaxModbusGrowattController(GrowattMinController):
             len(self.strategic_intents),
         )
 
-        # Log intent transitions for debugging
         for period in range(1, len(self.strategic_intents)):
             if self.strategic_intents[period] != self.strategic_intents[period - 1]:
                 logger.info(
@@ -160,15 +169,14 @@ class SolaxModbusGrowattController(GrowattMinController):
                     self.strategic_intents[period],
                 )
 
-        # Build display state for API/UI consumption
-        self._update_vpp_display_state()
+        self._update_tou_display_state()
 
     # ── VPP enable/disable ───────────────────────────────────────────────────
 
     def _enable_vpp(self, controller) -> None:
         """Enable VPP control.
 
-        VPP Status is written once (or if it was disabled) followed by 1s pause.
+        VPP Status is written once (or if disabled) followed by 1s pause.
         VPP Remote Control is written every period together with power commands.
         """
         if not self._vpp_status_enabled:
@@ -180,7 +188,8 @@ class SolaxModbusGrowattController(GrowattMinController):
                 entity_id=VPP_STATUS_ENTITY,
                 option=VPP_ENABLE,
             )
-            self._vpp_status_enabled = True
+            if not controller.test_mode:
+                self._vpp_status_enabled = True
             logger.info("HARDWARE: Waiting 1s after enabling VPP Status")
             time.sleep(1)
 
@@ -192,10 +201,11 @@ class SolaxModbusGrowattController(GrowattMinController):
             entity_id=VPP_REMOTE_CONTROL_ENTITY,
             option=VPP_ENABLE,
         )
-        self._vpp_enabled = True
+        if not controller.test_mode:
+            self._vpp_enabled = True
 
     def _disable_vpp(self, controller) -> None:
-        """Disable VPP remote control with required 1s delay between steps.
+        """Disable VPP control cleanly.
 
         Sequence: Status → wait 1s → Remote Control
         """
@@ -207,6 +217,7 @@ class SolaxModbusGrowattController(GrowattMinController):
             entity_id=VPP_STATUS_ENTITY,
             option=VPP_DISABLE,
         )
+        self._vpp_status_enabled = False
         logger.info("HARDWARE: Waiting 1s before disabling VPP Remote Control")
         time.sleep(1)
         logger.info("HARDWARE: VPP Remote Control -> Disabled")
@@ -218,13 +229,11 @@ class SolaxModbusGrowattController(GrowattMinController):
             option=VPP_DISABLE,
         )
         self._vpp_enabled = False
-        self._vpp_status_enabled = False
-        logger.info("VPP remote control disabled")
 
     def deinitialize_hardware(self, controller) -> None:
         """Disable VPP control cleanly on BESS shutdown.
 
-        Mirrors initialize_hardware — should be called from battery_system_manager
+        Mirrors initialize_hardware. Should be called from battery_system_manager
         shutdown hook, e.g. via SIGTERM handler in the addon entry point:
 
             signal.signal(signal.SIGTERM, lambda s, f: manager.deinitialize_hardware())
@@ -244,28 +253,37 @@ class SolaxModbusGrowattController(GrowattMinController):
 
     # ── Intent → VPP power ───────────────────────────────────────────────────
 
-    def _intent_to_vpp_power(
-        self, intent: str, discharge_rate: int, charge_rate: int
-    ) -> int:
-        """Convert a strategic intent and rates to a VPP power percentage.
+    def _intent_to_vpp(
+        self, intent: str, discharge_rate: int, grid_charge: bool
+    ) -> tuple[int, int]:
+        """Convert strategic intent to (vpp_power, vpp_control).
+
+        vpp_control: 1 = VPP active (Remote Control Enabled)
+                     0 = load first (Remote Control Disabled)
+        vpp_power:   -100 = full discharge/export
+                      0   = no active power command
+                      100 = full charge
 
         Args:
-            intent: Strategic intent (e.g. BATTERY_EXPORT)
-            discharge_rate: Discharge rate 0-100%
-            charge_rate: Charge rate 0-100%
+            intent: Strategic intent string
+            discharge_rate: Discharge rate 0-100% from schedule
+            grid_charge: Whether grid charging is active
 
         Returns:
-            VPP power %: negative=discharge to grid, positive=charge, 0=idle
+            Tuple of (vpp_power, vpp_control)
         """
         if intent == "BATTERY_EXPORT":
-            return -min(discharge_rate, 100)
+            if discharge_rate >= VPP_EXPORT_THRESHOLD_PCT:
+                return -100, 1
+            else:
+                return 0, 0
         elif intent == "GRID_CHARGING":
-            return min(charge_rate, 100)
-        elif intent == "LOAD_SUPPORT":
-            return -min(discharge_rate, 100)
+            return 100, 1
+        elif intent == "SOLAR_EXPORT":
+            return 0, 1
         else:
-            # SOLAR_STORAGE, IDLE
-            return 0
+            # SOLAR_STORAGE, LOAD_SUPPORT, IDLE
+            return 0, 0
 
     # ── Hardware interface ────────────────────────────────────────────────────
 
@@ -281,7 +299,7 @@ class SolaxModbusGrowattController(GrowattMinController):
         Args:
             controller: HomeAssistantAPIController instance
             grid_charge: Whether grid charging is active this period
-            discharge_rate: Discharge power rate (0-100%)
+            discharge_rate: Discharge power rate (0-100%), post-inhibit
 
         Returns:
             Tuple of (success, error_message).
@@ -294,19 +312,18 @@ class SolaxModbusGrowattController(GrowattMinController):
         if current_period < len(self.strategic_intents):
             intent = self.strategic_intents[current_period]
 
-        charge_rate = self.battery_settings.charging_power_rate if grid_charge else 0
-        vpp_power = self._intent_to_vpp_power(intent, discharge_rate, charge_rate)
+        vpp_power, vpp_control = self._intent_to_vpp(intent, discharge_rate, grid_charge)
 
         logger.info(
-            "Period %d (%02d:%02d): intent=%s vpp_power=%d%% "
-            "(discharge_rate=%d%% charge_rate=%d%%)",
+            "Period %d (%02d:%02d): intent=%s discharge_rate=%d%% "
+            "vpp_power=%d%% vpp_control=%d",
             current_period,
             now.hour,
             now.minute,
             intent,
-            vpp_power,
             discharge_rate,
-            charge_rate,
+            vpp_power,
+            vpp_control,
         )
 
         # VPP Status written once; Remote Control written every period
@@ -333,13 +350,15 @@ class SolaxModbusGrowattController(GrowattMinController):
             logger.error("FAILED: Reset VPP timer: %s", e)
             errors.append(str(e))
 
-        # Enable/disable AC charging based on grid_charge parameter —
-        # battery_system_manager is the authoritative source for this,
-        # matching how the TOU implementation works.
-        ac_charging_needed = grid_charge
-        if ac_charging_needed != self._ac_charging_enabled:
+        # Enable/disable AC charging based on grid_charge — only write on change
+        if grid_charge != self._ac_charging_enabled:
             try:
-                option = VPP_ENABLE if ac_charging_needed else VPP_DISABLE
+                option = VPP_ENABLE if grid_charge else VPP_DISABLE
+                logger.info(
+                    "HARDWARE: VPP Allow AC charging -> %s (intent=%s)",
+                    option,
+                    intent,
+                )
                 controller._service_call_with_retry(
                     "select",
                     "select_option",
@@ -347,12 +366,8 @@ class SolaxModbusGrowattController(GrowattMinController):
                     entity_id=VPP_ALLOW_AC_CHARGING_ENTITY,
                     option=option,
                 )
-                self._ac_charging_enabled = ac_charging_needed
-                logger.info(
-                    "HARDWARE: VPP Allow AC charging -> %s (intent=%s)",
-                    option,
-                    intent,
-                )
+                if not controller.test_mode:
+                    self._ac_charging_enabled = grid_charge
             except Exception as e:
                 logger.error("FAILED: Set VPP Allow AC charging: %s", e)
                 errors.append(str(e))
@@ -360,6 +375,11 @@ class SolaxModbusGrowattController(GrowattMinController):
         # Write VPP power — only on change
         if vpp_power != self._last_written_vpp_power:
             try:
+                logger.info(
+                    "HARDWARE: VPP power %s%% -> %d%%",
+                    self._last_written_vpp_power,
+                    vpp_power,
+                )
                 controller._service_call_with_retry(
                     "number",
                     "set_value",
@@ -367,12 +387,8 @@ class SolaxModbusGrowattController(GrowattMinController):
                     entity_id=VPP_POWER_ENTITY,
                     value=vpp_power,
                 )
-                logger.info(
-                    "HARDWARE: VPP power %s%% -> %d%%",
-                    self._last_written_vpp_power,
-                    vpp_power,
-                )
-                self._last_written_vpp_power = vpp_power
+                if not controller.test_mode:
+                    self._last_written_vpp_power = vpp_power
             except Exception as e:
                 logger.error("FAILED: Set VPP power to %d%%: %s", vpp_power, e)
                 errors.append(str(e))
@@ -391,9 +407,6 @@ class SolaxModbusGrowattController(GrowattMinController):
     ) -> tuple[int, int]:
         """Enable VPP and write initial power for the current period.
 
-        Called when a new schedule is activated. No batch TOU write needed —
-        subsequent periods are handled per-period in apply_period.
-
         Returns:
             Tuple of (writes, disables) — disables always 0 for VPP.
         """
@@ -404,23 +417,24 @@ class SolaxModbusGrowattController(GrowattMinController):
         if current_period < len(self.strategic_intents):
             intent = self.strategic_intents[current_period]
 
-        # Derive rates from schedule actions if available
+        # Get discharge rate from schedule actions if available
         discharge_rate = 0
-        charge_rate = 0
         if self.current_schedule:
             actions = self.current_schedule.original_dp_results.get("action", [])
             if current_period < len(actions):
                 action_kwh = actions[current_period]
-                max_kw = self.battery_settings.max_discharge_power_kw
-                if max_kw > 0:
-                    if action_kwh < 0:
-                        discharge_rate = int(
-                            min(abs(action_kwh * 4) / max_kw * 100, 100)
+                if action_kwh < 0 and self.battery_settings.max_discharge_power_kw > 0:
+                    discharge_rate = int(
+                        min(
+                            abs(action_kwh * 4)
+                            / self.battery_settings.max_discharge_power_kw
+                            * 100,
+                            100,
                         )
-                    else:
-                        charge_rate = int(min(action_kwh * 4 / max_kw * 100, 100))
+                    )
 
-        vpp_power = self._intent_to_vpp_power(intent, discharge_rate, charge_rate)
+        grid_charge = intent == "GRID_CHARGING"
+        vpp_power, vpp_control = self._intent_to_vpp(intent, discharge_rate, grid_charge)
 
         try:
             self._enable_vpp(controller)
@@ -443,10 +457,12 @@ class SolaxModbusGrowattController(GrowattMinController):
                 entity_id=VPP_POWER_ENTITY,
                 value=vpp_power,
             )
-            self._last_written_vpp_power = vpp_power
+            if not controller.test_mode:
+                self._last_written_vpp_power = vpp_power
             logger.info(
-                "VPP: Initial write — power=%d%% (period %d, intent %s)",
+                "VPP: Initial write — power=%d%% control=%d (period %d, intent %s)",
                 vpp_power,
+                vpp_control,
                 current_period,
                 intent,
             )
@@ -488,7 +504,7 @@ class SolaxModbusGrowattController(GrowattMinController):
             self._ac_charging_enabled = False
             self._last_written_vpp_power = None
 
-        self._update_vpp_display_state()
+        self._update_tou_display_state()
 
     def initialize_hardware(self, controller) -> None:
         """Sync SOC limits — VPP enabled on first write_schedule_to_hardware."""
@@ -501,11 +517,7 @@ class SolaxModbusGrowattController(GrowattMinController):
         other_schedule: "SolaxModbusGrowattController",
         from_period: int = 0,
     ) -> tuple[bool, str]:
-        """Compare schedules by strategic intent list.
-
-        Two schedules differ when any period at or after from_period has a
-        different strategic intent.
-        """
+        """Compare schedules by strategic intent list."""
         current = self.strategic_intents
         new = other_schedule.strategic_intents
 
@@ -528,11 +540,10 @@ class SolaxModbusGrowattController(GrowattMinController):
         logger.info("DECISION: Schedules match")
         return False, ""
 
-    # ── Display / logging ─────────────────────────────────────────────────────
+    # ── TOU display (kept for API/UI compatibility) ───────────────────────────
 
-    def _update_vpp_display_state(self) -> None:
+    def _update_tou_display_state(self) -> None:
         """Update TOU interval lists for API/display compatibility."""
-        # Build display segments from strategic intents for UI consumption
         groups = self.get_detailed_period_groups()
         if not groups:
             self.tou_intervals = []
@@ -565,8 +576,9 @@ class SolaxModbusGrowattController(GrowattMinController):
         return [seg.copy() for seg in self.tou_intervals]
 
     def get_all_tou_segments(self, current_period: int | None = None):
-        """Return display segments with is_current flag."""
-        return self._update_vpp_display_state() or self.tou_intervals
+        """Return display segments for API/UI consumption."""
+        self._update_tou_display_state()
+        return self.tou_intervals
 
     def log_current_TOU_schedule(self, header=None) -> None:
         """Log current VPP state."""
