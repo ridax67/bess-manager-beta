@@ -380,6 +380,21 @@ class SolaxModbusGrowattController(GrowattMinController):
 
         # AC charging is permanently enabled — no dynamic control needed
 
+        # Signal reactive automation to run when SOLAR_EXPORT is active.
+        # The automation varies VPP Power between -100 and 0 to keep grid
+        # exchange near zero. Only SOLAR_EXPORT uses reactive control —
+        # BATTERY_EXPORT and GRID_CHARGING use fixed power values.
+        try:
+            reactive_control = intent == "SOLAR_EXPORT"
+            controller._service_call_with_retry(
+                "input_boolean",
+                "turn_on" if reactive_control else "turn_off",
+                operation="VPP reactive control signal",
+                entity_id="input_boolean.vpp_reactive_control",
+            )
+        except Exception as e:
+            logger.error("FAILED: Set VPP reactive control signal: %s", e)
+
         # Write VPP power — only on change
         if vpp_power != self._last_written_vpp_power:
             try:
