@@ -282,8 +282,8 @@ class SolaxModbusGrowattController(GrowattMinController):
             # TODO: AC charging power set to 40% — change value here if needed
             return 40, 1
         elif intent == "SOLAR_EXPORT":
-            # If battery is full, load first is sufficient — solar exports naturally.
-            # Grid first with power=0 drains ~200W from battery unnecessarily.
+            # Battery full → load first, solar exports naturally without draining battery.
+            # Battery not full → grid first power=0, prevents solar from charging battery.
             if current_soc is not None and current_soc >= 100:
                 return 0, 0
             return 0, 1
@@ -318,7 +318,7 @@ class SolaxModbusGrowattController(GrowattMinController):
         if current_period < len(self.strategic_intents):
             intent = self.strategic_intents[current_period]
 
-        # Read current SOC for SOLAR_EXPORT load first decision
+        # Read current SOC for SOLAR_EXPORT decision
         current_soc = controller.get_battery_soc()
 
         vpp_power, vpp_control = self._intent_to_vpp(
